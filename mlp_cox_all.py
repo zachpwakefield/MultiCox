@@ -11,17 +11,13 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import torch, torch.nn as nn
+import torch
+import torch.nn as nn
 from lifelines.utils import concordance_index
 from sklearn.model_selection import StratifiedKFold, train_test_split
 import optuna, shap, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-import os, json, math, numpy as np, torch, shap, matplotlib.pyplot as plt
-from pathlib import Path
-from typing  import Dict, List
-from torch   import nn, Tensor
 
 # ───────────────── reproducibility / device ────────────────────
 SEED = 42
@@ -66,6 +62,46 @@ def minmax_01(x: torch.Tensor, eps: float = 1e-9):
 
 def apply_minmax(x: torch.Tensor, x_min: torch.Tensor, x_rng: torch.Tensor):
     return (x - x_min) / x_rng
+
+def scale_modalities(
+    X: torch.Tensor,
+    names: List[str],
+    mod2idx: Dict[str, torch.Tensor],
+    eps: float = 1e-9,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scale selected modalities and return stats for reuse."""
+
+    X = X.clone()
+    x_min = torch.zeros(X.shape[1], dtype=X.dtype)
+    x_rng = torch.ones(X.shape[1], dtype=X.dtype)
+
+    # --- GEX: per-feature min–max -----------------------------------------
+    g_idx = mod2idx.get("GEX")
+    if g_idx is not None:
+        g_min = X[:, g_idx].amin(0)
+        g_rng = X[:, g_idx].amax(0) - g_min + eps
+        X[:, g_idx] = (X[:, g_idx] - g_min) / g_rng
+        x_min[g_idx] = g_min
+        x_rng[g_idx] = g_rng
+
+    # --- HIT: assume values in [-1, 1] -----------------------------------
+    h_idx = mod2idx.get("HIT")
+    if h_idx is not None:
+        X[:, h_idx] = (X[:, h_idx] + 1.0) / 2.0
+        x_min[h_idx] = -1.0
+        x_rng[h_idx] = 2.0
+
+    # --- AGE --------------------------------------------------------------
+    try:
+        age_idx = names.index("CLIN::AGE")
+    except ValueError:
+        age_idx = None
+    if age_idx is not None:
+        X[:, age_idx] = (X[:, age_idx] - 1.0) / (120.0 - 1.0)
+        x_min[age_idx] = 1.0
+        x_rng[age_idx] = 119.0
+
+    return X, x_min, x_rng
 
 def read_matrix(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, index_col=0).apply(pd.to_numeric, errors="coerce")
@@ -204,8 +240,16 @@ class _VAE(nn.Module):
         kld=-0.5*(1+logv-mu.pow(2)-logv.exp()).mean()
         return recon,kld
 
-def _train_autoencoder(loader, model, epochs, noise_p=0.1):
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+def _train_autoencoder(
+    loader,
+    model,
+    epochs,
+    noise_p=0.1,
+    *,
+    lr=1e-3,
+    weight_decay=0.0,
+):
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse = nn.MSELoss()
     is_vae = isinstance(model, _VAE)            # ⇠ only VAEs have a KL term
 
@@ -234,12 +278,20 @@ def apply_saved_scale(x, path):
 def _save_encoder_weights(net: _DAE, path: Path) -> None:
     sd = { f"net.{k}": v for k, v in net.enc.state_dict().items() }  # add prefix once
     torch.save(sd, path)
-def _ensure_encoders(enc_dir: Path,
-                     X: torch.Tensor,
-                     mod2idx: Dict[str, torch.Tensor],
-                     overwrite: bool,
-                    latent: int,
-                    clin_lat: int) -> None:
+def _ensure_encoders(
+    enc_dir: Path,
+    X: torch.Tensor,
+    mod2idx: Dict[str, torch.Tensor],
+    overwrite: bool,
+    *,
+    latent: int,
+    clin_lat: int,
+    drop: float = 0.3,
+    lr: float = 1e-3,
+    wd: float = 0.0,
+    noise: float = 0.1,
+    epochs: int = 70,
+) -> None:
     """
     Train one DAE per modality on exactly the same MAD-filtered tensors that will
     feed the survival model, then save encoder weights into `enc_dir`.
@@ -268,8 +320,15 @@ def _ensure_encoders(enc_dir: Path,
 
     # ---------- GEX -----------------------------------------------------------
     gex_block = X[:, mod2idx["GEX"]]
-    dae = _DAE(gex_block.shape[1], latent=latent).to(DEVICE)
-    _train_autoencoder(_make_loader(gex_block, bs=256), dae, epochs=70)
+    dae = _DAE(gex_block.shape[1], latent=latent, p_drop=drop).to(DEVICE)
+    _train_autoencoder(
+        _make_loader(gex_block, bs=256),
+        dae,
+        epochs,
+        noise_p=noise,
+        lr=lr,
+        weight_decay=wd,
+    )
     _save_encoder_weights(dae, enc_dir / "GEX_encoder.pt")
     del dae; gc.collect(); torch.cuda.empty_cache()
 
@@ -278,8 +337,15 @@ def _ensure_encoders(enc_dir: Path,
         block = X[:, mod2idx[k]]
         if block.shape[1] == 0:
             continue                           # some cancers miss a splice type
-        dae = _DAE(block.shape[1], latent=latent).to(DEVICE)
-        _train_autoencoder(_make_loader(block, bs=256), dae, epochs=70)
+        dae = _DAE(block.shape[1], latent=latent, p_drop=drop).to(DEVICE)
+        _train_autoencoder(
+            _make_loader(block, bs=256),
+            dae,
+            epochs,
+            noise_p=noise,
+            lr=lr,
+            weight_decay=wd,
+        )
         _save_encoder_weights(dae, enc_dir / f"{k}_encoder.pt")
         del dae; gc.collect(); torch.cuda.empty_cache()
 
@@ -290,6 +356,59 @@ def _ensure_encoders(enc_dir: Path,
     # del dae; gc.collect(); torch.cuda.empty_cache()
 
     print("[INFO] Encoder pre-training complete")
+
+
+def search_encoder_hparams(X: torch.Tensor, raw_idx: Dict[str, torch.Tensor], trials: int = 20):
+    """Return best hyperparameters for encoder pretraining via Optuna."""
+
+    def mad_topk(block: torch.Tensor, k: int):
+        med = block.median(0).values
+        mad = (block - med).abs().median(0).values
+        return torch.topk(mad, min(k, block.shape[1])).indices
+
+    gex_raw = X[:, raw_idx["GEX"]]
+    idx = np.arange(len(gex_raw))
+    tr_idx, va_idx = train_test_split(idx, test_size=0.2, random_state=SEED)
+
+    def objective(trial: optuna.Trial) -> float:
+        cfg = {
+            "latent": trial.suggest_int("latent", 64, 512, step=64),
+            "drop": trial.suggest_float("drop", 0.1, 0.5),
+            "lr": trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            "wd": trial.suggest_float("wd", 1e-6, 1e-3, log=True),
+            "noise": trial.suggest_float("noise", 0.0, 0.2),
+            "epochs": trial.suggest_int("epochs", 20, 100, step=20),
+            "mad_k": trial.suggest_int("mad_k", 1000, 8000, step=1000),
+        }
+
+        feat_idx = mad_topk(gex_raw, cfg["mad_k"])
+        tr = gex_raw[tr_idx][:, feat_idx]
+        va = gex_raw[va_idx][:, feat_idx]
+
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(tr), batch_size=256, shuffle=True, drop_last=True
+        )
+        model = _DAE(tr.shape[1], latent=cfg["latent"], p_drop=cfg["drop"]).to(DEVICE)
+        _train_autoencoder(
+            loader, model, cfg["epochs"], noise_p=cfg["noise"], lr=cfg["lr"], weight_decay=cfg["wd"]
+        )
+
+        model.eval()
+        mse = nn.MSELoss()
+        va_loss = 0.0
+        with torch.no_grad():
+            for (x,) in torch.utils.data.DataLoader(torch.utils.data.TensorDataset(va), batch_size=256):
+                x = x.to(DEVICE)
+                recon = model(x)
+                va_loss += mse(recon, x).item() * len(x)
+        return va_loss / len(va)
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=trials)
+
+    print("[ENCODER SEARCH] best val loss:", study.best_value)
+    print("[ENCODER SEARCH] params:", study.best_params)
+    return study.best_params
 
 
 def _add_prefix(state_dict: dict, prefix: str) -> dict:
@@ -326,10 +445,17 @@ def load_omics(code:int,with_clin:bool)->Tuple[torch.Tensor,np.ndarray,np.ndarra
     if with_clin:
         frames,c_names=[],[]
         for col,pref in [("stage_code","STAGE"),("gender_code","GEND"),("race_code","RACE")]:
-            oh=one_hot(clin[col],pref); frames.append(oh.values); c_names+=list(oh.columns)
-        age=(clin["age_at_diagnosis"].astype(np.float32)-1)/(120-1)
-        frames.append(age.values[:,None]); c_names.append("AGE_Z")
-        X=np.hstack([X]+frames); names+=[f"CLIN::{n}" for n in c_names]
+            oh = one_hot(clin[col], pref)
+            frames.append(oh.values)
+            c_names += list(oh.columns)
+
+        # keep age unscaled for now – will apply formula later
+        age = clin["age_at_diagnosis"].astype(np.float32)
+        frames.append(age.values[:, None])
+        c_names.append("AGE")
+
+        X = np.hstack([X] + frames)
+        names += [f"CLIN::{n}" for n in c_names]
 
     t=clin["OS.time"].to_numpy(np.float32)
     e=clin["OS.event"].to_numpy(np.float32)
@@ -337,7 +463,7 @@ def load_omics(code:int,with_clin:bool)->Tuple[torch.Tensor,np.ndarray,np.ndarra
     return torch.tensor(X[keep],dtype=torch.float32),t[keep],e[keep],names
 
 
-def cv_objective(trial, X, t, e, mod2idx, cancer):
+def cv_objective(trial, X, t, e, mod2idx, names, cancer):
     cfg = {
         "latent":  trial.suggest_int("latent", 64, 1024),
         "drop":    trial.suggest_float("drop", 0.1, 0.5),
@@ -346,9 +472,6 @@ def cv_objective(trial, X, t, e, mod2idx, cancer):
         "epochs":  trial.suggest_int("epochs", 100, 400, 50),
         "clin_lat": trial.suggest_int("clin_lat", 32, 128)
     }
-    ## remove if needed
-    cfg['latent'] = 128
-    cfg['latent'] = 32
 
     y   = strat_labels(t, e)
     skf = StratifiedKFold(4, shuffle=True, random_state=SEED)
@@ -361,7 +484,7 @@ def cv_objective(trial, X, t, e, mod2idx, cancer):
         load_pretrained_encoders(net, cancer, ENC_DIR)
 
         # ----- scale train + val identically -----
-        X_tr, x_min, x_rng = minmax_01(X[tr_idx].clone())
+        X_tr, x_min, x_rng = scale_modalities(X[tr_idx].clone(), names, mod2idx)
         X_va               = apply_minmax(X[va_idx].clone(), x_min, x_rng)
 
         batch_tr = {m: X_tr[:, idx].to(DEVICE) for m, idx in mod2idx.items()}
@@ -476,10 +599,10 @@ def fit_full(X_dev,t_dev,e_dev,mod2idx,cfg,model_dir,fusion,cancer,x_min,x_rng):
 
 def run_shap(
     net:           nn.Module,
-    X:             Tensor,
-    mod2idx:       Dict[str, Tensor],
-    x_min:         Tensor,
-    x_rng:         Tensor,
+    X:             torch.Tensor,
+    mod2idx:       Dict[str, torch.Tensor],
+    x_min:         torch.Tensor,
+    x_rng:         torch.Tensor,
     feat_names:    List[str],
     out_dir:       Path,
     *,
@@ -587,6 +710,8 @@ def main():
     pa.add_argument("--with_clin",action="store_true")
     pa.add_argument("--fusion",choices=["concat","gate"],default="gate")
     pa.add_argument("--max_trials",type=int,default=40)
+    pa.add_argument("--enc_trials",type=int,default=0,
+                    help="Number of Optuna trials for encoder search")
     pa.add_argument("--use_preloaded", action="store_true",
                help="If set, expect PRELOADED_DATA tuple in mlp_cox_job namespace")
     pa.add_argument("--overwrite", action="store_true",
@@ -607,33 +732,56 @@ def main():
         print("[INFO] Using tensors from PRELOADED_DATA")
     else:
         X, t, e, names = load_omics(code,with_clin=args.with_clin)
-    raw_idx=build_mod2idx(names)
+    raw_idx = build_mod2idx(names)
 
-    def mad_topk(X_block,k):
-        med=X_block.median(0).values; mad=(X_block-med).abs().median(0).values
-        return torch.topk(mad,min(k,X_block.shape[1])).indices
+    def mad_topk(X_block, k):
+        med = X_block.median(0).values
+        mad = (X_block - med).abs().median(0).values
+        return torch.topk(mad, min(k, X_block.shape[1])).indices
 
-    # mod2idx={"GEX":mad_topk(X[:,raw_idx["GEX"]],5000),
-    #          "CLIN":raw_idx["CLIN"]}
+    enc_cfg = {
+        "latent": 128,
+        "drop": 0.3,
+        "lr": 1e-3,
+        "wd": 0.0,
+        "noise": 0.1,
+        "epochs": 70,
+        "mad_k": 5000,
+    }
 
-    # for k in EVENT_KEYS: mod2idx[k]=mad_topk(X[:,raw_idx[k]],5000)
+    if args.enc_trials:
+        best = search_encoder_hparams(X, raw_idx, trials=args.enc_trials)
+        enc_cfg.update(best)
+
     mod2idx = {
-        "GEX":  raw_idx["GEX"][ mad_topk(X[:, raw_idx["GEX"]], 5000) ],
+        "GEX": raw_idx["GEX"][ mad_topk(X[:, raw_idx["GEX"]], enc_cfg["mad_k"]) ],
         "CLIN": raw_idx["CLIN"],
     }
     for k in EVENT_KEYS:
-        mod2idx[k] = raw_idx[k][ mad_topk(X[:, raw_idx[k]], 5000) ]
+        mod2idx[k] = raw_idx[k][ mad_topk(X[:, raw_idx[k]], enc_cfg["mad_k"]) ]
 
     tr_idx,te_idx=train_test_split(np.arange(len(X)),test_size=0.15,
                                    stratify=strat_labels(t,e),random_state=SEED)
     X_dev,X_test=X[tr_idx],X[te_idx]
     t_dev,e_dev=t[tr_idx],e[tr_idx]
 
-    X_dev,mi,rng=minmax_01(X_dev.clone())
-    X_test=apply_minmax(X_test.clone(),mi,rng)
+    X_dev, mi, rng = scale_modalities(X_dev.clone(), names, mod2idx)
+    X_test = apply_minmax(X_test.clone(), mi, rng)
 
     cancer_enc_dir = ENC_DIR / args.cancer          # e.g. encoders/BRCA/
-    _ensure_encoders(cancer_enc_dir, X_dev, mod2idx, args.overwrite, 128, 32)
+    _ensure_encoders(
+        cancer_enc_dir,
+        X_dev,
+        mod2idx,
+        args.overwrite,
+        latent=enc_cfg["latent"],
+        clin_lat=32,
+        drop=enc_cfg["drop"],
+        lr=enc_cfg["lr"],
+        wd=enc_cfg["wd"],
+        noise=enc_cfg["noise"],
+        epochs=enc_cfg["epochs"],
+    )
 
     if args.shap_only:
         print("[CONFIG] SHAP only ...")
@@ -676,7 +824,10 @@ def main():
         study=optuna.create_study(direction="maximize",sampler=optuna.samplers.TPESampler(seed=SEED),
                                   storage=f"sqlite:///{ROOT_DIR}/optuna/{args.cancer}.db",
                                   study_name=f"{args.cancer}_MM",load_if_exists=True)
-        study.optimize(lambda tr: cv_objective(tr,X_dev,t_dev,e_dev,mod2idx,args.cancer),n_trials=args.max_trials)
+        study.optimize(
+            lambda tr: cv_objective(tr, X_dev, t_dev, e_dev, mod2idx, names, args.cancer),
+            n_trials=args.max_trials,
+        )
 
         print("Best C-index:", study.best_value)
         print("Params:", json.dumps(study.best_params, indent=2))

@@ -502,13 +502,13 @@ def load_omics(code:int,with_clin:bool)->Tuple[torch.Tensor,np.ndarray,np.ndarra
     return torch.tensor(X[keep],dtype=torch.float32),t[keep],e[keep],names
 
 
-def cv_objective(trial, X, t, e, mod2idx, names, cancer):
+def cv_objective(trial, X, t, e, mod2idx, names, cancer, enc_cfg):
     cfg = {
-        "latent":  trial.suggest_int("latent", 64, 1024),
-        "drop":    trial.suggest_float("drop", 0.1, 0.5),
+        "latent":  enc_cfg["latent"],
+        "drop":    enc_cfg["drop"],
         "lr":      trial.suggest_float("lr", 1e-4, 3e-3, log=True),
         "wd":      trial.suggest_float("wd", 1e-6, 1e-3, log=True),
-        "epochs":  trial.suggest_int("epochs", 100, 400, 50),
+        "epochs":  trial.suggest_int("epochs", 100, 400, step=50),
         "clin_lat": trial.suggest_int("clin_lat", 32, 128)
     }
 
@@ -864,13 +864,16 @@ def main():
                                   storage=f"sqlite:///{ROOT_DIR}/optuna/{args.cancer}.db",
                                   study_name=f"{args.cancer}_MM",load_if_exists=True)
         study.optimize(
-            lambda tr: cv_objective(tr, X_dev, t_dev, e_dev, mod2idx, names, args.cancer),
+            lambda tr: cv_objective(tr, X_dev, t_dev, e_dev, mod2idx, names, args.cancer, enc_cfg),
             n_trials=args.max_trials,
         )
 
         print("Best C-index:", study.best_value)
         print("Params:", json.dumps(study.best_params, indent=2))
-        cfg=study.best_trial.params|{"clin_lat":32}
+        cfg = study.best_trial.params | {
+            "latent": enc_cfg["latent"],
+            "drop":   enc_cfg["drop"],
+        }
     else:
         # best_score_dev = 1
         # best_params=optuna.load_study(study_name=f"{args.cancer}_MM",
@@ -879,7 +882,14 @@ def main():
 
         # best_cfg = best_params
         # print("Best hyper-params:", best_cfg)
-        cfg={"latent":128,"drop":0.3,"lr":8e-5,"wd":1e-4,"epochs":200,"clin_lat":32}
+        cfg={
+            "latent": enc_cfg["latent"],
+            "drop":   enc_cfg["drop"],
+            "lr":      8e-5,
+            "wd":      1e-4,
+            "epochs":  200,
+            "clin_lat":32,
+        }
 
     print("[CONFIG]",json.dumps(cfg,indent=2))
     model_dir=ROOT_DIR/"models"/args.cancer

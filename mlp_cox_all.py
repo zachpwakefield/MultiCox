@@ -358,10 +358,24 @@ def _ensure_encoders(
     print("[INFO] Encoder pre-training complete")
 
 
-def search_encoder_hparams(X: torch.Tensor, raw_idx: Dict[str, torch.Tensor], trials: int = 20):
-    """Return best hyperparameters for encoder pretraining via Optuna."""
+def search_encoder_hparams(
+    X: torch.Tensor,
+    raw_idx: Dict[str, torch.Tensor],
+    trials: int = 20,
+) -> Dict[str, float]:
+    """Optuna search over DAE pretraining hyperparameters.
 
-    def mad_topk(block: torch.Tensor, k: int):
+    The following variables are tuned:
+      - ``latent``  : encoder latent dimension
+      - ``drop``    : dropout probability
+      - ``lr``      : learning rate
+      - ``wd``      : weight decay
+      - ``noise``   : corruption noise for the DAE
+      - ``epochs``  : number of pretraining epochs
+      - ``mad_k``   : features kept per modality via MAD filtering
+    """
+
+    def mad_topk(block: torch.Tensor, k: int) -> torch.Tensor:
         med = block.median(0).values
         mad = (block - med).abs().median(0).values
         return torch.topk(mad, min(k, block.shape[1])).indices
@@ -381,27 +395,52 @@ def search_encoder_hparams(X: torch.Tensor, raw_idx: Dict[str, torch.Tensor], tr
             "mad_k": trial.suggest_int("mad_k", 1000, 8000, step=1000),
         }
 
-        feat_idx = mad_topk(gex_raw, cfg["mad_k"])
-        tr = gex_raw[tr_idx][:, feat_idx]
-        va = gex_raw[va_idx][:, feat_idx]
-
-        loader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(tr), batch_size=256, shuffle=True, drop_last=True
-        )
-        model = _DAE(tr.shape[1], latent=cfg["latent"], p_drop=cfg["drop"]).to(DEVICE)
-        _train_autoencoder(
-            loader, model, cfg["epochs"], noise_p=cfg["noise"], lr=cfg["lr"], weight_decay=cfg["wd"]
-        )
-
-        model.eval()
+        # ----- evaluate DAE reconstruction on each modality separately -----
         mse = nn.MSELoss()
-        va_loss = 0.0
-        with torch.no_grad():
-            for (x,) in torch.utils.data.DataLoader(torch.utils.data.TensorDataset(va), batch_size=256):
-                x = x.to(DEVICE)
-                recon = model(x)
-                va_loss += mse(recon, x).item() * len(x)
-        return va_loss / len(va)
+        total_loss = 0.0
+        n_modalities = 0
+        modalities = ["GEX", *EVENT_KEYS]
+
+        for m in modalities:
+            block = X[:, raw_idx[m]]
+            if block.shape[1] == 0:
+                continue
+
+            feat_idx = mad_topk(block, cfg["mad_k"])
+            tr = block[tr_idx][:, feat_idx]
+            va = block[va_idx][:, feat_idx]
+
+            loader = torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(tr),
+                batch_size=256,
+                shuffle=True,
+                drop_last=True,
+            )
+            model = _DAE(tr.shape[1], latent=cfg["latent"], p_drop=cfg["drop"]).to(DEVICE)
+            _train_autoencoder(
+                loader,
+                model,
+                cfg["epochs"],
+                noise_p=cfg["noise"],
+                lr=cfg["lr"],
+                weight_decay=cfg["wd"],
+            )
+
+            model.eval()
+            va_loss = 0.0
+            with torch.no_grad():
+                va_loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(va), batch_size=256
+                )
+                for (x,) in va_loader:
+                    x = x.to(DEVICE)
+                    recon = model(x)
+                    va_loss += mse(recon, x).item() * len(x)
+
+            total_loss += va_loss / len(va)
+            n_modalities += 1
+
+        return total_loss / max(n_modalities, 1)
 
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=trials)

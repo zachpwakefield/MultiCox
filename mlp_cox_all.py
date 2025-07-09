@@ -35,6 +35,8 @@ CLIN_CSV  = DATA_ROOT / "harmonized" / "clinical_harmonized_numeric.csv"
 
 ENC_DIR   = DATA_ROOT / "survivalModel" / "encoders"
 ENC_DIR.mkdir(parents=True, exist_ok=True)
+ENC_OPTUNA = ENC_DIR / "optuna"
+ENC_OPTUNA.mkdir(parents=True, exist_ok=True)
 
 ROOT_DIR  = DATA_ROOT / "survivalModel" / "ensemble"
 for p in ["models","optuna","logs","shap"]:
@@ -361,6 +363,7 @@ def _ensure_encoders(
 def search_encoder_hparams(
     X: torch.Tensor,
     raw_idx: Dict[str, torch.Tensor],
+    cancer: str,
     trials: int = 20,
 ) -> Dict[str, float]:
     """Optuna search over DAE pretraining hyperparameters.
@@ -442,7 +445,13 @@ def search_encoder_hparams(
 
         return total_loss / max(n_modalities, 1)
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+        storage=f"sqlite:///{ENC_OPTUNA}/{cancer}.db",
+        study_name=f"{cancer}_ENC",
+        load_if_exists=True,
+    )
     study.optimize(objective, n_trials=trials)
 
     print("[ENCODER SEARCH] best val loss:", study.best_value)
@@ -789,8 +798,20 @@ def main():
     }
 
     if args.enc_trials:
-        best = search_encoder_hparams(X, raw_idx, trials=args.enc_trials)
+        best = search_encoder_hparams(X, raw_idx, args.cancer, trials=args.enc_trials)
         enc_cfg.update(best)
+    else:
+        enc_db = ENC_OPTUNA / f"{args.cancer}.db"
+        if enc_db.exists():
+            try:
+                study = optuna.load_study(
+                    study_name=f"{args.cancer}_ENC",
+                    storage=f"sqlite:///{enc_db}",
+                )
+                enc_cfg.update(study.best_params)
+                print(f"[INFO] Loaded encoder params from {enc_db}")
+            except Exception as ex:
+                print("[WARN] Could not load encoder study:", ex)
 
     mod2idx = {
         "GEX": raw_idx["GEX"][ mad_topk(X[:, raw_idx["GEX"]], enc_cfg["mad_k"]) ],

@@ -67,6 +67,46 @@ def minmax_01(x: torch.Tensor, eps: float = 1e-9):
 def apply_minmax(x: torch.Tensor, x_min: torch.Tensor, x_rng: torch.Tensor):
     return (x - x_min) / x_rng
 
+def scale_modalities(
+    X: torch.Tensor,
+    names: List[str],
+    mod2idx: Dict[str, torch.Tensor],
+    eps: float = 1e-9,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scale selected modalities and return stats for reuse."""
+
+    X = X.clone()
+    x_min = torch.zeros(X.shape[1], dtype=X.dtype)
+    x_rng = torch.ones(X.shape[1], dtype=X.dtype)
+
+    # --- GEX: per-feature min–max -----------------------------------------
+    g_idx = mod2idx.get("GEX")
+    if g_idx is not None:
+        g_min = X[:, g_idx].amin(0)
+        g_rng = X[:, g_idx].amax(0) - g_min + eps
+        X[:, g_idx] = (X[:, g_idx] - g_min) / g_rng
+        x_min[g_idx] = g_min
+        x_rng[g_idx] = g_rng
+
+    # --- HIT: assume values in [-1, 1] -----------------------------------
+    h_idx = mod2idx.get("HIT")
+    if h_idx is not None:
+        X[:, h_idx] = (X[:, h_idx] + 1.0) / 2.0
+        x_min[h_idx] = -1.0
+        x_rng[h_idx] = 2.0
+
+    # --- AGE --------------------------------------------------------------
+    try:
+        age_idx = names.index("CLIN::AGE")
+    except ValueError:
+        age_idx = None
+    if age_idx is not None:
+        X[:, age_idx] = (X[:, age_idx] - 1.0) / (120.0 - 1.0)
+        x_min[age_idx] = 1.0
+        x_rng[age_idx] = 119.0
+
+    return X, x_min, x_rng
+
 def read_matrix(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, index_col=0).apply(pd.to_numeric, errors="coerce")
 
@@ -326,10 +366,17 @@ def load_omics(code:int,with_clin:bool)->Tuple[torch.Tensor,np.ndarray,np.ndarra
     if with_clin:
         frames,c_names=[],[]
         for col,pref in [("stage_code","STAGE"),("gender_code","GEND"),("race_code","RACE")]:
-            oh=one_hot(clin[col],pref); frames.append(oh.values); c_names+=list(oh.columns)
-        age=(clin["age_at_diagnosis"].astype(np.float32)-1)/(120-1)
-        frames.append(age.values[:,None]); c_names.append("AGE_Z")
-        X=np.hstack([X]+frames); names+=[f"CLIN::{n}" for n in c_names]
+            oh = one_hot(clin[col], pref)
+            frames.append(oh.values)
+            c_names += list(oh.columns)
+
+        # keep age unscaled for now – will apply formula later
+        age = clin["age_at_diagnosis"].astype(np.float32)
+        frames.append(age.values[:, None])
+        c_names.append("AGE")
+
+        X = np.hstack([X] + frames)
+        names += [f"CLIN::{n}" for n in c_names]
 
     t=clin["OS.time"].to_numpy(np.float32)
     e=clin["OS.event"].to_numpy(np.float32)
@@ -337,7 +384,7 @@ def load_omics(code:int,with_clin:bool)->Tuple[torch.Tensor,np.ndarray,np.ndarra
     return torch.tensor(X[keep],dtype=torch.float32),t[keep],e[keep],names
 
 
-def cv_objective(trial, X, t, e, mod2idx, cancer):
+def cv_objective(trial, X, t, e, mod2idx, names, cancer):
     cfg = {
         "latent":  trial.suggest_int("latent", 64, 1024),
         "drop":    trial.suggest_float("drop", 0.1, 0.5),
@@ -361,7 +408,7 @@ def cv_objective(trial, X, t, e, mod2idx, cancer):
         load_pretrained_encoders(net, cancer, ENC_DIR)
 
         # ----- scale train + val identically -----
-        X_tr, x_min, x_rng = minmax_01(X[tr_idx].clone())
+        X_tr, x_min, x_rng = scale_modalities(X[tr_idx].clone(), names, mod2idx)
         X_va               = apply_minmax(X[va_idx].clone(), x_min, x_rng)
 
         batch_tr = {m: X_tr[:, idx].to(DEVICE) for m, idx in mod2idx.items()}
@@ -629,8 +676,8 @@ def main():
     X_dev,X_test=X[tr_idx],X[te_idx]
     t_dev,e_dev=t[tr_idx],e[tr_idx]
 
-    X_dev,mi,rng=minmax_01(X_dev.clone())
-    X_test=apply_minmax(X_test.clone(),mi,rng)
+    X_dev, mi, rng = scale_modalities(X_dev.clone(), names, mod2idx)
+    X_test = apply_minmax(X_test.clone(), mi, rng)
 
     cancer_enc_dir = ENC_DIR / args.cancer          # e.g. encoders/BRCA/
     _ensure_encoders(cancer_enc_dir, X_dev, mod2idx, args.overwrite, 128, 32)
@@ -676,7 +723,10 @@ def main():
         study=optuna.create_study(direction="maximize",sampler=optuna.samplers.TPESampler(seed=SEED),
                                   storage=f"sqlite:///{ROOT_DIR}/optuna/{args.cancer}.db",
                                   study_name=f"{args.cancer}_MM",load_if_exists=True)
-        study.optimize(lambda tr: cv_objective(tr,X_dev,t_dev,e_dev,mod2idx,args.cancer),n_trials=args.max_trials)
+        study.optimize(
+            lambda tr: cv_objective(tr, X_dev, t_dev, e_dev, mod2idx, names, args.cancer),
+            n_trials=args.max_trials,
+        )
 
         print("Best C-index:", study.best_value)
         print("Params:", json.dumps(study.best_params, indent=2))
